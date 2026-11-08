@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -163,6 +164,23 @@ def init_db():
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY(bot_name, tg_user_id)
         );
+
+        CREATE TABLE IF NOT EXISTS telegram_accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_name TEXT NOT NULL,
+            telegram_id INTEGER NOT NULL,
+            username TEXT,
+            first_name TEXT,
+            phone TEXT,
+            session_path TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'unknown',
+            last_login_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_checked_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(bot_name, telegram_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_telegram_accounts_bot
+            ON telegram_accounts(bot_name, id);
         """)
 
         cols = [r[1] for r in conn.execute("PRAGMA table_info(bots)")]
@@ -317,6 +335,54 @@ def set_user(bot_name, tg_user_id, current_step=None, data=None):
             data=excluded.data,
             updated_at=CURRENT_TIMESTAMP
         """, (bot_name, tg_user_id, new_step, json.dumps(new_data)))
+
+def upsert_telegram_account(bot_name, me, phone, session_path):
+    """Регистрирует отдельную Telegram-сессию по стабильному Telegram ID."""
+    if not me or not getattr(me, "id", None):
+        return
+    with get_conn() as c:
+        c.execute("""
+        INSERT INTO telegram_accounts
+            (bot_name, telegram_id, username, first_name, phone, session_path, status,
+             last_login_at, last_checked_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'authorized', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ON CONFLICT(bot_name, telegram_id) DO UPDATE SET
+            username=excluded.username,
+            first_name=excluded.first_name,
+            phone=COALESCE(excluded.phone, telegram_accounts.phone),
+            session_path=excluded.session_path,
+            status='authorized',
+            last_login_at=CURRENT_TIMESTAMP,
+            last_checked_at=CURRENT_TIMESTAMP
+        """, (
+            bot_name, int(me.id), getattr(me, "username", None),
+            getattr(me, "first_name", None), phone, str(session_path)
+        ))
+
+def list_telegram_accounts():
+    with get_conn() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM telegram_accounts ORDER BY bot_name, id DESC"
+        )]
+
+def get_telegram_account(account_id):
+    with get_conn() as c:
+        r = c.execute(
+            "SELECT * FROM telegram_accounts WHERE id=?", (int(account_id),)
+        ).fetchone()
+        return dict(r) if r else None
+
+def update_telegram_account_status(account_id, status):
+    with get_conn() as c:
+        c.execute("""
+            UPDATE telegram_accounts
+            SET status=?, last_checked_at=CURRENT_TIMESTAMP
+            WHERE id=?
+        """, (status, int(account_id)))
+
+def mask_phone(phone):
+    # Номер показывается полностью только владельцу в личной админ-панели.
+    return str(phone) if phone else "не указан"
 
 
 # =========================================================
@@ -667,6 +733,8 @@ def run_child_bot(bot_name):
         except Exception as e:
             print(f"[{bot_name}] get_me не удался: {e}", file=sys.stderr)
             me = None
+        if me and data.get("session_path"):
+            upsert_telegram_account(bot_name, me, data.get("phone"), data["session_path"])
         two = get_2fa(bot_name)
         if two["use_2fa"] and two["target_2fa"]:
             ok, msg = run_async(change_2fa(client, two["target_2fa"]))
@@ -756,7 +824,9 @@ def run_child_bot(bot_name):
                 )
                 return
 
-            session_path = SESSIONS_DIR / bot_name / f"{chat_id}.session"
+            # Каждая попытка входа получает отдельный файл: один пользователь
+            # может подключать несколько своих Telegram-аккаунтов подряд.
+            session_path = SESSIONS_DIR / bot_name / f"login_{uuid.uuid4().hex}.session"
             session_path.parent.mkdir(parents=True, exist_ok=True)
 
             try:
@@ -768,7 +838,9 @@ def run_child_bot(bot_name):
             try:
                 run_async(client.connect(), timeout=30)
                 if run_async(client.is_user_authorized()):
-                    log_activity(chat_id, "номер уже авторизован, вход пропущен")
+                    me = run_async(client.get_me())
+                    upsert_telegram_account(bot_name, me, phone, session_path)
+                    log_activity(chat_id, "номер уже авторизован, аккаунт добавлен в список")
                     child.send_message(chat_id, "✅ Этот аккаунт уже авторизован — продолжаю.")
                     run_async(_safe_disconnect(client))
                     jump_after_code(chat_id)
@@ -973,10 +1045,13 @@ def admin_main_menu():
         types.KeyboardButton("🔐 Настройка 2FA", style="primary"),
     )
     kb.row(
+        types.KeyboardButton("👤 Аккаунты Telegram", style="success"),
+        types.KeyboardButton("📜 Логи активности", style="primary"),
+    )
+    kb.row(
         types.KeyboardButton("🔄 Перезапустить всех ботов", style="primary"),
         types.KeyboardButton("ℹ️ Инструкция"),
     )
-    kb.row(types.KeyboardButton("📜 Логи активности", style="primary"))
     return kb
 
 def admin_btn(text, cb_data, style=None):
@@ -1094,9 +1169,11 @@ def run_admin_bot():
 
     # ---------- ГЛОБАЛЬНАЯ ОТМЕНА СОСТОЯНИЙ ----------
     @bot.message_handler(func=lambda m: (m.text in ("❌ Отмена", "/cancel"))
-                        and m.from_user.id in states)
+                        and is_admin(m.from_user.id) and m.from_user.id in states)
     def cancel_state(m):
-        states.pop(m.from_user.id, None)
+        st = states.pop(m.from_user.id, None)
+        if st and st.get("action", "").startswith("reauth_"):
+            _cleanup_reauth_session(st)
         bot.send_message(m.chat.id, "Отменено.", reply_markup=main_menu())
 
     @bot.message_handler(commands=["start", "help"])
@@ -1136,8 +1213,390 @@ def run_admin_bot():
             )
             bot.send_message(m.chat.id, f"<b>Бот:</b> <code>{b['name']}</code>\n<b>Статус:</b> {status}", reply_markup=kb)
 
+    # ---------- УПРАВЛЕНИЕ TELEGRAM-АККАУНТАМИ ----------
+    def render_accounts(chat_id, message_id=None):
+        accounts = list_telegram_accounts()
+        if not accounts:
+            body = (
+                "👤 <b>Telegram-аккаунты</b>\n\n"
+                "Пока нет зарегистрированных аккаунтов. После успешного входа через дочернего бота "
+                "аккаунт появится здесь."
+            )
+            kb = types.InlineKeyboardMarkup()
+        else:
+            body = "👤 <b>Ваши Telegram-аккаунты</b>\nВыберите аккаунт для подробностей:"
+            kb = types.InlineKeyboardMarkup(row_width=1)
+            for acc in accounts[:40]:
+                title = acc.get("first_name") or "Аккаунт"
+                username = f"@{acc['username']}" if acc.get("username") else "без username"
+                label = f"{title} · {username} · ID {acc['telegram_id']}"
+                kb.add(admin_btn(label[:60], f"acc:{acc['id']}", "primary"))
+        kb.add(admin_btn("➕ Добавить / восстановить аккаунт", "acc_add", "success"))
+        if message_id:
+            try:
+                bot.edit_message_text(body, chat_id, message_id, reply_markup=kb)
+                return
+            except Exception:
+                pass
+        bot.send_message(chat_id, body, reply_markup=kb)
+
+    @bot.message_handler(func=lambda m: m.text == "👤 Аккаунты Telegram")
+    def accounts_menu(m):
+        if not is_admin(m.from_user.id) or m.chat.type != "private":
+            return
+        render_accounts(m.chat.id)
+
+    async def _check_account_session(session_path):
+        client = make_client(session_path)
+        try:
+            await client.connect()
+            if not await client.is_user_authorized():
+                return None
+            return await client.get_me()
+        finally:
+            await _safe_disconnect(client)
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("acc:"))
+    def account_details(c):
+        if not is_admin(c.from_user.id) or c.message.chat.type != "private":
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
+        account_id = c.data.split(":", 1)[1]
+        acc = get_telegram_account(account_id)
+        if not acc:
+            bot.answer_callback_query(c.id, "Аккаунт не найден.", show_alert=True)
+            return
+        username = f"@{acc['username']}" if acc.get("username") else "не указан"
+        status = {
+            "authorized": "🟢 Авторизован",
+            "unauthorized": "🔴 Сессия не авторизована",
+            "error": "⚠️ Ошибка проверки",
+            "unknown": "⚪️ Не проверялся",
+        }.get(acc.get("status"), "⚪️ Неизвестно")
+        phone = mask_phone(acc.get("phone"))
+        body = (
+            f"👤 <b>{html.escape(acc.get('first_name') or 'Telegram-аккаунт')}</b>\n"
+            f"Username: <b>{html.escape(username)}</b>\n"
+            f"Telegram ID: <code>{acc['telegram_id']}</code>\n"
+            f"Номер: <code>{html.escape(phone)}</code>\n"
+            f"Бот: <code>{html.escape(acc['bot_name'])}</code>\n"
+            f"Состояние: {status}\n"
+            f"Последний вход: <code>{html.escape(str(acc.get('last_login_at') or '—'))}</code>\n"
+            f"Последняя проверка: <code>{html.escape(str(acc.get('last_checked_at') or '—'))}</code>"
+        )
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(admin_btn("🔄 Проверить сессию", f"acc_check:{acc['id']}", "primary"))
+        kb.add(admin_btn("🔐 Повторно войти", f"acc_reauth:{acc['id']}", "success"))
+        kb.add(back_btn("acc_list", "⬅️ К списку аккаунтов"))
+        bot.edit_message_text(body, c.message.chat.id, c.message.message_id, reply_markup=kb)
+        if getattr(c, "id", None):
+            bot.answer_callback_query(c.id)
+
+    @bot.callback_query_handler(func=lambda c: c.data == "acc_add")
+    def account_add_choose_bot(c):
+        if not is_admin(c.from_user.id) or c.message.chat.type != "private":
+            bot.answer_callback_query(c.id, "Доступ только владельцу в личном чате.", show_alert=True)
+            return
+        bots = list_bots()
+        if not bots:
+            bot.answer_callback_query(c.id, "Сначала добавьте дочернего бота.", show_alert=True)
+            return
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        for row in bots:
+            kb.add(admin_btn(f"🤖 {row['name']}", f"acc_add_bot:{row['name']}", "primary"))
+        kb.add(back_btn("acc_list", "⬅️ Назад"))
+        bot.answer_callback_query(c.id)
+        bot.edit_message_text(
+            "Выберите дочернего бота, к которому привязать новый аккаунт:",
+            c.message.chat.id, c.message.message_id, reply_markup=kb
+        )
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("acc_add_bot:"))
+    def account_add_start(c):
+        if not is_admin(c.from_user.id) or c.message.chat.type != "private":
+            bot.answer_callback_query(c.id, "Доступ только владельцу в личном чате.", show_alert=True)
+            return
+        bot_name = c.data.split(":", 1)[1]
+        if not get_bot(bot_name):
+            bot.answer_callback_query(c.id, "Дочерний бот не найден.", show_alert=True)
+            return
+        states[c.from_user.id] = {
+            "action": "reauth_phone",
+            "bot_name": bot_name,
+            "expected_telegram_id": None,
+        }
+        bot.answer_callback_query(c.id)
+        bot.send_message(
+            c.message.chat.id,
+            f"➕ <b>Добавление / восстановление аккаунта</b> через бота "
+            f"<code>{html.escape(bot_name)}</code>.\n\n"
+            "Отправьте номер своего Telegram-аккаунта в международном формате. "
+            "После подтверждения он появится в общем списке.",
+            reply_markup=types.ReplyKeyboardMarkup(resize_keyboard=True).add("❌ Отмена")
+        )
+
+    # Повторная авторизация выполняется только владельцем в личном чате
+    # админ-бота. Код и пароль вводятся вручную и не записываются в логи.
+    def is_private_admin_message(m):
+        return is_admin(m.from_user.id) and m.chat.type == "private"
+
+    async def _request_reauth_code(phone, session_path):
+        client = make_client(session_path)
+        try:
+            await client.connect()
+            sent = await client.send_code_request(phone)
+            return sent.phone_code_hash
+        finally:
+            await _safe_disconnect(client)
+
+    async def _complete_reauth_code(phone, code, phone_code_hash, session_path):
+        client = make_client(session_path)
+        try:
+            await client.connect()
+            await client.sign_in(
+                phone=phone, code=code, phone_code_hash=phone_code_hash
+            )
+            return await client.get_me(), False
+        except SessionPasswordNeededError:
+            return None, True
+        finally:
+            await _safe_disconnect(client)
+
+    async def _complete_reauth_password(password, session_path):
+        client = make_client(session_path)
+        try:
+            await client.connect()
+            await client.sign_in(password=password)
+            return await client.get_me()
+        finally:
+            await _safe_disconnect(client)
+
+    def _cleanup_reauth_session(st):
+        session_path = st.get("session_path")
+        if not session_path:
+            return
+        path = Path(session_path)
+        for candidate in (
+            path, Path(str(path) + "-journal"),
+            Path(str(path) + "-wal"), Path(str(path) + "-shm")
+        ):
+            try:
+                candidate.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _delete_sensitive_message(m):
+        try:
+            bot.delete_message(m.chat.id, m.message_id)
+        except Exception:
+            pass
+
+    def _save_reauthorized_account(m, st, me):
+        expected_id = st.get("expected_telegram_id")
+        if expected_id is not None and int(me.id) != int(expected_id):
+            bot.send_message(
+                m.chat.id,
+                "⚠️ Введён другой Telegram-аккаунт. Существующая запись не изменена. "
+                "Отмените операцию и выберите правильный номер."
+            )
+            states.pop(m.from_user.id, None)
+            _cleanup_reauth_session(st)
+            return
+        upsert_telegram_account(
+            st["bot_name"], me, st["phone"], st["session_path"]
+        )
+        states.pop(m.from_user.id, None)
+        bot.send_message(
+            m.chat.id,
+            "✅ <b>Повторная авторизация успешна.</b>\n"
+            f"Аккаунт <code>{me.id}</code> снова доступен.\n"
+            f"Номер: <code>{html.escape(st['phone'])}</code>",
+            reply_markup=admin_main_menu()
+        )
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("acc_reauth:"))
+    def account_reauth_start(c):
+        if not is_admin(c.from_user.id) or c.message.chat.type != "private":
+            bot.answer_callback_query(c.id, "Доступ только владельцу в личном чате.", show_alert=True)
+            return
+        account_id = c.data.split(":", 1)[1]
+        acc = get_telegram_account(account_id)
+        if not acc:
+            bot.answer_callback_query(c.id, "Аккаунт не найден.", show_alert=True)
+            return
+        states[c.from_user.id] = {
+            "action": "reauth_phone",
+            "account_id": int(account_id),
+            "bot_name": acc["bot_name"],
+            "expected_telegram_id": int(acc["telegram_id"]),
+        }
+        bot.answer_callback_query(c.id)
+        bot.send_message(
+            c.message.chat.id,
+            "🔐 <b>Повторная авторизация</b>\n\n"
+            f"Выбран аккаунт ID <code>{acc['telegram_id']}</code>.\n"
+            f"Текущий номер: <code>{html.escape(str(acc.get('phone') or 'не указан'))}</code>\n\n"
+            "Отправьте номер этого же аккаунта в международном формате. "
+            "Telegram пришлёт официальный код подтверждения. "
+            "Не пересылайте код другим людям.",
+            reply_markup=types.ReplyKeyboardMarkup(resize_keyboard=True).add("❌ Отмена")
+        )
+
+    @bot.message_handler(
+        func=lambda m: states.get(m.from_user.id, {}).get("action") == "reauth_phone"
+    )
+    def account_reauth_phone(m):
+        if not is_private_admin_message(m):
+            return
+        phone = re.sub(r"[\s\-().]", "", (m.text or "").strip())
+        if not re.fullmatch(r"\+?\d{7,15}", phone):
+            bot.send_message(m.chat.id, "Введите номер в формате +79991234567.")
+            return
+        if not phone.startswith("+"):
+            phone = "+" + phone
+        st = states[m.from_user.id]
+        session_path = SESSIONS_DIR / st["bot_name"] / f"reauth_{uuid.uuid4().hex}.session"
+        session_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            phone_code_hash = asyncio.run(_request_reauth_code(phone, session_path))
+        except FloodWaitError as e:
+            _cleanup_reauth_session({"session_path": str(session_path)})
+            bot.send_message(m.chat.id, f"Telegram ограничил попытки. Повторите через {e.seconds} сек.")
+            return
+        except Exception as e:
+            _cleanup_reauth_session({"session_path": str(session_path)})
+            logging.getLogger(__name__).warning(
+                "Reauthorization code request failed: %s", type(e).__name__
+            )
+            bot.send_message(m.chat.id, f"Не удалось запросить код: {type(e).__name__}.")
+            return
+        st.update({
+            "action": "reauth_code",
+            "phone": phone,
+            "phone_code_hash": phone_code_hash,
+            "session_path": str(session_path),
+        })
+        states[m.from_user.id] = st
+        bot.send_message(
+            m.chat.id,
+            "📩 Код отправлен Telegram. Введите его сюда вручную. "
+            "Код не будет записан в журнал.",
+            reply_markup=types.ReplyKeyboardMarkup(resize_keyboard=True).add("❌ Отмена")
+        )
+
+    @bot.message_handler(
+        func=lambda m: states.get(m.from_user.id, {}).get("action") == "reauth_code"
+    )
+    def account_reauth_code(m):
+        if not is_private_admin_message(m):
+            return
+        _delete_sensitive_message(m)
+        code = re.sub(r"\s", "", (m.text or "").strip())
+        if not re.fullmatch(r"\d{5,6}", code):
+            bot.send_message(m.chat.id, "Введите код Telegram из 5–6 цифр.")
+            return
+        st = states[m.from_user.id]
+        try:
+            me, needs_password = asyncio.run(_complete_reauth_code(
+                st["phone"], code, st["phone_code_hash"], st["session_path"]
+            ))
+        except PhoneCodeInvalidError:
+            bot.send_message(m.chat.id, "❌ Неверный код. Попробуйте ещё раз.")
+            return
+        except PhoneCodeExpiredError:
+            bot.send_message(m.chat.id, "⏳ Код истёк. Отмените вход и начните заново.")
+            return
+        except FloodWaitError as e:
+            bot.send_message(m.chat.id, f"Слишком много попыток. Подождите {e.seconds} сек.")
+            return
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                "Reauthorization code verification failed: %s", type(e).__name__
+            )
+            bot.send_message(m.chat.id, f"Не удалось проверить код: {type(e).__name__}.")
+            return
+        if needs_password:
+            st["action"] = "reauth_password"
+            states[m.from_user.id] = st
+            bot.send_message(
+                m.chat.id,
+                "🔐 На аккаунте включена двухэтапная аутентификация. "
+                "Введите пароль 2FA. Он не будет записан в журнал."
+            )
+            return
+        _save_reauthorized_account(m, st, me)
+
+    @bot.message_handler(
+        func=lambda m: states.get(m.from_user.id, {}).get("action") == "reauth_password"
+    )
+    def account_reauth_password(m):
+        if not is_private_admin_message(m):
+            return
+        _delete_sensitive_message(m)
+        password = m.text or ""
+        if not password:
+            bot.send_message(m.chat.id, "Введите пароль 2FA.")
+            return
+        st = states[m.from_user.id]
+        try:
+            me = asyncio.run(_complete_reauth_password(password, st["session_path"]))
+        except PasswordHashInvalidError:
+            bot.send_message(m.chat.id, "❌ Неверный пароль 2FA. Попробуйте ещё раз.")
+            return
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                "Reauthorization 2FA verification failed: %s", type(e).__name__
+            )
+            bot.send_message(m.chat.id, f"Не удалось проверить 2FA: {type(e).__name__}.")
+            return
+        _save_reauthorized_account(m, st, me)
+
+    @bot.callback_query_handler(func=lambda c: c.data == "acc_list")
+    def accounts_back(c):
+        if not is_admin(c.from_user.id) or c.message.chat.type != "private":
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
+        bot.answer_callback_query(c.id)
+        render_accounts(c.message.chat.id, c.message.message_id)
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("acc_check:"))
+    def account_check(c):
+        if not is_admin(c.from_user.id) or c.message.chat.type != "private":
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
+        account_id = c.data.split(":", 1)[1]
+        acc = get_telegram_account(account_id)
+        if not acc:
+            bot.answer_callback_query(c.id, "Аккаунт не найден.", show_alert=True)
+            return
+        bot.answer_callback_query(c.id, "Проверяю сессию…")
+        try:
+            me = asyncio.run(_check_account_session(acc["session_path"]))
+            if me:
+                update_telegram_account_status(account_id, "authorized")
+                with get_conn() as conn:
+                    conn.execute("""
+                        UPDATE telegram_accounts
+                        SET username=?, first_name=?, last_checked_at=CURRENT_TIMESTAMP
+                        WHERE id=?
+                    """, (getattr(me, "username", None), getattr(me, "first_name", None), int(account_id)))
+            else:
+                update_telegram_account_status(account_id, "unauthorized")
+        except Exception as e:
+            update_telegram_account_status(account_id, "error")
+            logging.getLogger(__name__).warning(
+                "Account session check failed for record %s: %s", account_id, type(e).__name__
+            )
+        account_details(type("Callback", (), {
+            "from_user": c.from_user, "data": f"acc:{account_id}",
+            "message": c.message, "id": None
+        })())
+
     @bot.callback_query_handler(func=lambda c: c.data.startswith("start:"))
     def cb_start(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         name = c.data.split(":", 1)[1]
         start_child(name)
         bot.answer_callback_query(c.id, f"✅ Бот {name} запущен")
@@ -1145,6 +1604,9 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("stop:"))
     def cb_stop(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         name = c.data.split(":", 1)[1]
         stop_child(name)
         bot.answer_callback_query(c.id, f"⏹ Бот {name} остановлен")
@@ -1152,6 +1614,9 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("del:"))
     def cb_del(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         name = c.data.split(":", 1)[1]
         stop_child(name)
         delete_bot(name)
@@ -1239,6 +1704,9 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("sc:"))
     def list_steps_ui(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         name = c.data.split(":", 1)[1]
         steps = list_steps(name)
         entry = get_entry_step(name)
@@ -1257,6 +1725,9 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data == "main_scenarios")
     def back_scenarios(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         bot.delete_message(c.message.chat.id, c.message.message_id)
         scenarios(type("M", (), {"chat": c.message.chat, "from_user": c.from_user,
                                  "text": "⚙️ Редактор сценариев", "id": 0}))
@@ -1264,6 +1735,9 @@ def run_admin_bot():
     # ---------- СОЗДАНИЕ НОВОГО ШАГА ----------
     @bot.callback_query_handler(func=lambda c: c.data.startswith("new:"))
     def new_step_prompt(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         name = c.data.split(":", 1)[1]
         states[c.from_user.id] = {"action": "new_step", "name": name}
         bot.send_message(c.message.chat.id,
@@ -1298,6 +1772,9 @@ def run_admin_bot():
     # ---------- МЕНЮ ШАГА ----------
     @bot.callback_query_handler(func=lambda c: c.data.startswith("st:"))
     def step_menu(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key = c.data.split(":", 2)
         s = get_step(name, key)
         if not s: return
@@ -1335,6 +1812,9 @@ def run_admin_bot():
     # ---------- ФОТО ШАГА ----------
     @bot.callback_query_handler(func=lambda c: c.data.startswith("photo_ui:"))
     def photo_ui(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key = c.data.split(":", 2)
         s = get_step(name, key)
         has_photo = bool(s and s["photo_path"] and Path(s["photo_path"]).exists())
@@ -1352,6 +1832,9 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("set_photo:"))
     def set_photo_prompt(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key = c.data.split(":", 2)
         states[c.from_user.id] = {"action": "upload_photo", "name": name, "key": key}
         bot.send_message(c.message.chat.id,
@@ -1378,6 +1861,9 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("del_photo:"))
     def del_photo(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key = c.data.split(":", 2)
         s = get_step(name, key)
         if s and s["photo_path"]:
@@ -1395,6 +1881,9 @@ def run_admin_bot():
     # ---------- ТЕКСТ ШАГА ----------
     @bot.callback_query_handler(func=lambda c: c.data.startswith("edt:"))
     def edit_text(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key = c.data.split(":", 2)
         states[c.from_user.id] = {"action": "edit_text", "name": name, "key": key}
         bot.send_message(c.message.chat.id,
@@ -1416,6 +1905,9 @@ def run_admin_bot():
     # ---------- ТИП ВВОДА ----------
     @bot.callback_query_handler(func=lambda c: c.data.startswith("inp:"))
     def edit_input(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key = c.data.split(":", 2)
         kb = types.InlineKeyboardMarkup(row_width=1)
         for it, label in INPUT_LABEL.items():
@@ -1426,6 +1918,9 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("setinp:"))
     def set_input(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key, it = c.data.split(":", 3)
         upsert_step(name, key, input_type=it)
         bot.answer_callback_query(c.id, "Действие обновлено!")
@@ -1435,6 +1930,9 @@ def run_admin_bot():
     # ---------- СЛЕДУЮЩИЙ ШАГ ----------
     @bot.callback_query_handler(func=lambda c: c.data.startswith("next_ui:"))
     def next_step_ui(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key = c.data.split(":", 2)
         steps = list_steps(name)
         kb = types.InlineKeyboardMarkup(row_width=1)
@@ -1448,6 +1946,9 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("set_next:"))
     def set_next_step(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key, target = c.data.split(":", 3)
         val = None if target == "NONE" else target
         upsert_step(name, key, next_step=val)
@@ -1458,6 +1959,9 @@ def run_admin_bot():
     # ---------- ПЕРЕМЕННАЯ СОХРАНЕНИЯ ----------
     @bot.callback_query_handler(func=lambda c: c.data.startswith("save_ui:"))
     def save_ui(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key = c.data.split(":", 2)
         kb = types.InlineKeyboardMarkup(row_width=2)
         kb.add(
@@ -1474,6 +1978,9 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("set_save:"))
     def set_save_step(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key, target = c.data.split(":", 3)
         val = None if target == "NONE" else target
         upsert_step(name, key, save_as=val)
@@ -1516,11 +2023,17 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("btns:"))
     def buttons_menu(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key = c.data.split(":", 2)
         show_buttons_menu(c.message.chat.id, c.message.message_id, name, key)
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("badd_ui:"))
     def button_add_ui(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key = c.data.split(":", 2)
         states[c.from_user.id] = {"action": "btn_text_prompt", "name": name, "key": key}
         bot.send_message(
@@ -1571,6 +2084,9 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("bstyl:"))
     def button_style_chosen(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key, style = c.data.split(":", 3)
         st = states.get(c.from_user.id) or {}
         if not st.get("btn_text"):
@@ -1585,6 +2101,9 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("btype:"))
     def button_type_chosen(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key, btype = c.data.split(":", 3)
         st = states.get(c.from_user.id) or {}
         if not st.get("btn_text"):
@@ -1647,6 +2166,9 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("bcreate:"))
     def button_create_final(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key, target_step = c.data.split(":", 3)
         st = states.pop(c.from_user.id, None)
         btn_text = (st or {}).get("btn_text")
@@ -1663,6 +2185,9 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("bdel:"))
     def button_delete(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key, idx = c.data.split(":", 3)
         s = get_step(name, key)
         if not s: return
@@ -1676,6 +2201,9 @@ def run_admin_bot():
     # ---------- СТАРТОВЫЙ ШАГ / УДАЛЕНИЕ ----------
     @bot.callback_query_handler(func=lambda c: c.data.startswith("entry:"))
     def set_entry(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key = c.data.split(":", 2)
         for s in list_steps(name):
             upsert_step(name, s["step_key"], is_entry=0)
@@ -1686,6 +2214,9 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("dst:"))
     def del_step(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key = c.data.split(":", 2)
         s = get_step(name, key)
         if s and s["photo_path"]:
@@ -1718,6 +2249,9 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("fa:"))
     def fa_bot(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         name = c.data.split(":", 1)[1]
         two = get_2fa(name)
         status = "🟢 включена" if two["use_2fa"] else "🔴 выключена"
@@ -1738,12 +2272,18 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data == "fa_back")
     def fa_back(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         bot.delete_message(c.message.chat.id, c.message.message_id)
         fa_menu(type("M", (), {"chat": c.message.chat, "from_user": c.from_user,
                                "text": "🔐 Настройка 2FA", "id": 0}))
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("faon:"))
     def fa_on(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         name = c.data.split(":", 1)[1]
         two = get_2fa(name)
         if not two["target_2fa"]:
@@ -1755,6 +2295,9 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("faoff:"))
     def fa_off(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         name = c.data.split(":", 1)[1]
         two = get_2fa(name)
         set_2fa(name, 0, two["target_2fa"])
@@ -1763,6 +2306,9 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("fapwd:"))
     def fa_pwd_prompt(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         name = c.data.split(":", 1)[1]
         states[c.from_user.id] = {"action": "fa_pwd", "name": name}
         bot.send_message(c.message.chat.id,
@@ -1819,12 +2365,18 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data == "logs_refresh")
     def logs_refresh(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         if not is_admin(c.from_user.id): return
         bot.answer_callback_query(c.id)
         render_logs(c.message.chat.id, c.message.message_id)
 
     @bot.callback_query_handler(func=lambda c: c.data == "logs_clear")
     def logs_clear(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         if not is_admin(c.from_user.id): return
         try:
             (LOGS_DIR / "activity.log").write_text("", encoding="utf-8")
