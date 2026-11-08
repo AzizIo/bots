@@ -1289,7 +1289,8 @@ def run_admin_bot():
         kb.add(admin_btn("🔄 Проверить сессию", f"acc_check:{acc['id']}", "primary"))
         kb.add(back_btn("acc_list", "⬅️ К списку аккаунтов"))
         bot.edit_message_text(body, c.message.chat.id, c.message.message_id, reply_markup=kb)
-        bot.answer_callback_query(c.id)
+        if getattr(c, "id", None):
+            bot.answer_callback_query(c.id)
 
     @bot.callback_query_handler(func=lambda c: c.data == "acc_list")
     def accounts_back(c):
@@ -1329,7 +1330,7 @@ def run_admin_bot():
             )
         account_details(type("Callback", (), {
             "from_user": c.from_user, "data": f"acc:{account_id}",
-            "message": c.message, "id": c.id
+            "message": c.message, "id": None
         })())
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("start:"))
