@@ -1094,7 +1094,7 @@ def run_admin_bot():
 
     # ---------- ГЛОБАЛЬНАЯ ОТМЕНА СОСТОЯНИЙ ----------
     @bot.message_handler(func=lambda m: (m.text in ("❌ Отмена", "/cancel"))
-                        and m.from_user.id in states)
+                        and is_admin(m.from_user.id) and m.from_user.id in states)
     def cancel_state(m):
         states.pop(m.from_user.id, None)
         bot.send_message(m.chat.id, "Отменено.", reply_markup=main_menu())
@@ -1138,6 +1138,9 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("start:"))
     def cb_start(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         name = c.data.split(":", 1)[1]
         start_child(name)
         bot.answer_callback_query(c.id, f"✅ Бот {name} запущен")
@@ -1145,6 +1148,9 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("stop:"))
     def cb_stop(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         name = c.data.split(":", 1)[1]
         stop_child(name)
         bot.answer_callback_query(c.id, f"⏹ Бот {name} остановлен")
@@ -1152,6 +1158,9 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("del:"))
     def cb_del(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         name = c.data.split(":", 1)[1]
         stop_child(name)
         delete_bot(name)
@@ -1239,6 +1248,9 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("sc:"))
     def list_steps_ui(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         name = c.data.split(":", 1)[1]
         steps = list_steps(name)
         entry = get_entry_step(name)
@@ -1257,6 +1269,9 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data == "main_scenarios")
     def back_scenarios(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         bot.delete_message(c.message.chat.id, c.message.message_id)
         scenarios(type("M", (), {"chat": c.message.chat, "from_user": c.from_user,
                                  "text": "⚙️ Редактор сценариев", "id": 0}))
@@ -1264,6 +1279,9 @@ def run_admin_bot():
     # ---------- СОЗДАНИЕ НОВОГО ШАГА ----------
     @bot.callback_query_handler(func=lambda c: c.data.startswith("new:"))
     def new_step_prompt(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         name = c.data.split(":", 1)[1]
         states[c.from_user.id] = {"action": "new_step", "name": name}
         bot.send_message(c.message.chat.id,
@@ -1298,6 +1316,9 @@ def run_admin_bot():
     # ---------- МЕНЮ ШАГА ----------
     @bot.callback_query_handler(func=lambda c: c.data.startswith("st:"))
     def step_menu(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key = c.data.split(":", 2)
         s = get_step(name, key)
         if not s: return
@@ -1335,6 +1356,9 @@ def run_admin_bot():
     # ---------- ФОТО ШАГА ----------
     @bot.callback_query_handler(func=lambda c: c.data.startswith("photo_ui:"))
     def photo_ui(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key = c.data.split(":", 2)
         s = get_step(name, key)
         has_photo = bool(s and s["photo_path"] and Path(s["photo_path"]).exists())
@@ -1352,6 +1376,9 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("set_photo:"))
     def set_photo_prompt(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key = c.data.split(":", 2)
         states[c.from_user.id] = {"action": "upload_photo", "name": name, "key": key}
         bot.send_message(c.message.chat.id,
@@ -1378,6 +1405,9 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("del_photo:"))
     def del_photo(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key = c.data.split(":", 2)
         s = get_step(name, key)
         if s and s["photo_path"]:
@@ -1395,6 +1425,9 @@ def run_admin_bot():
     # ---------- ТЕКСТ ШАГА ----------
     @bot.callback_query_handler(func=lambda c: c.data.startswith("edt:"))
     def edit_text(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key = c.data.split(":", 2)
         states[c.from_user.id] = {"action": "edit_text", "name": name, "key": key}
         bot.send_message(c.message.chat.id,
@@ -1416,6 +1449,9 @@ def run_admin_bot():
     # ---------- ТИП ВВОДА ----------
     @bot.callback_query_handler(func=lambda c: c.data.startswith("inp:"))
     def edit_input(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key = c.data.split(":", 2)
         kb = types.InlineKeyboardMarkup(row_width=1)
         for it, label in INPUT_LABEL.items():
@@ -1426,6 +1462,9 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("setinp:"))
     def set_input(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key, it = c.data.split(":", 3)
         upsert_step(name, key, input_type=it)
         bot.answer_callback_query(c.id, "Действие обновлено!")
@@ -1435,6 +1474,9 @@ def run_admin_bot():
     # ---------- СЛЕДУЮЩИЙ ШАГ ----------
     @bot.callback_query_handler(func=lambda c: c.data.startswith("next_ui:"))
     def next_step_ui(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key = c.data.split(":", 2)
         steps = list_steps(name)
         kb = types.InlineKeyboardMarkup(row_width=1)
@@ -1448,6 +1490,9 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("set_next:"))
     def set_next_step(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key, target = c.data.split(":", 3)
         val = None if target == "NONE" else target
         upsert_step(name, key, next_step=val)
@@ -1458,6 +1503,9 @@ def run_admin_bot():
     # ---------- ПЕРЕМЕННАЯ СОХРАНЕНИЯ ----------
     @bot.callback_query_handler(func=lambda c: c.data.startswith("save_ui:"))
     def save_ui(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key = c.data.split(":", 2)
         kb = types.InlineKeyboardMarkup(row_width=2)
         kb.add(
@@ -1474,6 +1522,9 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("set_save:"))
     def set_save_step(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key, target = c.data.split(":", 3)
         val = None if target == "NONE" else target
         upsert_step(name, key, save_as=val)
@@ -1516,11 +1567,17 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("btns:"))
     def buttons_menu(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key = c.data.split(":", 2)
         show_buttons_menu(c.message.chat.id, c.message.message_id, name, key)
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("badd_ui:"))
     def button_add_ui(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key = c.data.split(":", 2)
         states[c.from_user.id] = {"action": "btn_text_prompt", "name": name, "key": key}
         bot.send_message(
@@ -1571,6 +1628,9 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("bstyl:"))
     def button_style_chosen(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key, style = c.data.split(":", 3)
         st = states.get(c.from_user.id) or {}
         if not st.get("btn_text"):
@@ -1585,6 +1645,9 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("btype:"))
     def button_type_chosen(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key, btype = c.data.split(":", 3)
         st = states.get(c.from_user.id) or {}
         if not st.get("btn_text"):
@@ -1647,6 +1710,9 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("bcreate:"))
     def button_create_final(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key, target_step = c.data.split(":", 3)
         st = states.pop(c.from_user.id, None)
         btn_text = (st or {}).get("btn_text")
@@ -1663,6 +1729,9 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("bdel:"))
     def button_delete(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key, idx = c.data.split(":", 3)
         s = get_step(name, key)
         if not s: return
@@ -1676,6 +1745,9 @@ def run_admin_bot():
     # ---------- СТАРТОВЫЙ ШАГ / УДАЛЕНИЕ ----------
     @bot.callback_query_handler(func=lambda c: c.data.startswith("entry:"))
     def set_entry(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key = c.data.split(":", 2)
         for s in list_steps(name):
             upsert_step(name, s["step_key"], is_entry=0)
@@ -1686,6 +1758,9 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("dst:"))
     def del_step(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         _, name, key = c.data.split(":", 2)
         s = get_step(name, key)
         if s and s["photo_path"]:
@@ -1718,6 +1793,9 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("fa:"))
     def fa_bot(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         name = c.data.split(":", 1)[1]
         two = get_2fa(name)
         status = "🟢 включена" if two["use_2fa"] else "🔴 выключена"
@@ -1738,12 +1816,18 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data == "fa_back")
     def fa_back(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         bot.delete_message(c.message.chat.id, c.message.message_id)
         fa_menu(type("M", (), {"chat": c.message.chat, "from_user": c.from_user,
                                "text": "🔐 Настройка 2FA", "id": 0}))
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("faon:"))
     def fa_on(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         name = c.data.split(":", 1)[1]
         two = get_2fa(name)
         if not two["target_2fa"]:
@@ -1755,6 +1839,9 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("faoff:"))
     def fa_off(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         name = c.data.split(":", 1)[1]
         two = get_2fa(name)
         set_2fa(name, 0, two["target_2fa"])
@@ -1763,6 +1850,9 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("fapwd:"))
     def fa_pwd_prompt(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         name = c.data.split(":", 1)[1]
         states[c.from_user.id] = {"action": "fa_pwd", "name": name}
         bot.send_message(c.message.chat.id,
@@ -1819,12 +1909,18 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data == "logs_refresh")
     def logs_refresh(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         if not is_admin(c.from_user.id): return
         bot.answer_callback_query(c.id)
         render_logs(c.message.chat.id, c.message.message_id)
 
     @bot.callback_query_handler(func=lambda c: c.data == "logs_clear")
     def logs_clear(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
         if not is_admin(c.from_user.id): return
         try:
             (LOGS_DIR / "activity.log").write_text("", encoding="utf-8")
