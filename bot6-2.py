@@ -381,12 +381,8 @@ def update_telegram_account_status(account_id, status):
         """, (status, int(account_id)))
 
 def mask_phone(phone):
-    if not phone:
-        return "не указан"
-    digits = re.sub(r"\\D", "", str(phone))
-    if len(digits) < 5:
-        return "••••"
-    return "+" + digits[:2] + "••••••" + digits[-3:]
+    # Номер показывается полностью только владельцу в личной админ-панели.
+    return str(phone) if phone else "не указан"
 
 
 # =========================================================
@@ -1287,10 +1283,202 @@ def run_admin_bot():
         )
         kb = types.InlineKeyboardMarkup(row_width=1)
         kb.add(admin_btn("🔄 Проверить сессию", f"acc_check:{acc['id']}", "primary"))
+        kb.add(admin_btn("🔐 Повторно войти", f"acc_reauth:{acc['id']}", "success"))
         kb.add(back_btn("acc_list", "⬅️ К списку аккаунтов"))
         bot.edit_message_text(body, c.message.chat.id, c.message.message_id, reply_markup=kb)
         if getattr(c, "id", None):
             bot.answer_callback_query(c.id)
+
+    # Повторная авторизация выполняется только владельцем в личном чате
+    # админ-бота. Код и пароль вводятся вручную и не записываются в логи.
+    def is_private_admin_message(m):
+        return is_admin(m.from_user.id) and m.chat.type == "private"
+
+    async def _request_reauth_code(phone, session_path):
+        client = make_client(session_path)
+        try:
+            await client.connect()
+            sent = await client.send_code_request(phone)
+            return sent.phone_code_hash
+        finally:
+            await _safe_disconnect(client)
+
+    async def _complete_reauth_code(phone, code, phone_code_hash, session_path):
+        client = make_client(session_path)
+        try:
+            await client.connect()
+            await client.sign_in(
+                phone=phone, code=code, phone_code_hash=phone_code_hash
+            )
+            return await client.get_me(), False
+        except SessionPasswordNeededError:
+            return None, True
+        finally:
+            await _safe_disconnect(client)
+
+    async def _complete_reauth_password(password, session_path):
+        client = make_client(session_path)
+        try:
+            await client.connect()
+            await client.sign_in(password=password)
+            return await client.get_me()
+        finally:
+            await _safe_disconnect(client)
+
+    def _save_reauthorized_account(m, st, me):
+        expected_id = int(st["expected_telegram_id"])
+        if int(me.id) != expected_id:
+            bot.send_message(
+                m.chat.id,
+                "⚠️ Введён другой Telegram-аккаунт. Существующая запись не изменена. "
+                "Отмените операцию и выберите правильный номер."
+            )
+            states.pop(m.from_user.id, None)
+            return
+        upsert_telegram_account(
+            st["bot_name"], me, st["phone"], st["session_path"]
+        )
+        states.pop(m.from_user.id, None)
+        bot.send_message(
+            m.chat.id,
+            "✅ <b>Повторная авторизация успешна.</b>\n"
+            f"Аккаунт <code>{me.id}</code> снова доступен.\n"
+            f"Номер: <code>{html.escape(st['phone'])}</code>",
+            reply_markup=admin_main_menu()
+        )
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("acc_reauth:"))
+    def account_reauth_start(c):
+        if not is_admin(c.from_user.id) or c.message.chat.type != "private":
+            bot.answer_callback_query(c.id, "Доступ только владельцу в личном чате.", show_alert=True)
+            return
+        account_id = c.data.split(":", 1)[1]
+        acc = get_telegram_account(account_id)
+        if not acc:
+            bot.answer_callback_query(c.id, "Аккаунт не найден.", show_alert=True)
+            return
+        states[c.from_user.id] = {
+            "action": "reauth_phone",
+            "account_id": int(account_id),
+            "bot_name": acc["bot_name"],
+            "expected_telegram_id": int(acc["telegram_id"]),
+        }
+        bot.answer_callback_query(c.id)
+        bot.send_message(
+            c.message.chat.id,
+            "🔐 <b>Повторная авторизация</b>\n\n"
+            f"Выбран аккаунт ID <code>{acc['telegram_id']}</code>.\n"
+            f"Текущий номер: <code>{html.escape(str(acc.get('phone') or 'не указан'))}</code>\n\n"
+            "Отправьте номер этого же аккаунта в международном формате. "
+            "Telegram пришлёт официальный код подтверждения. "
+            "Не пересылайте код другим людям.",
+            reply_markup=types.ReplyKeyboardMarkup(resize_keyboard=True).add("❌ Отмена")
+        )
+
+    @bot.message_handler(
+        func=lambda m: states.get(m.from_user.id, {}).get("action") == "reauth_phone"
+    )
+    def account_reauth_phone(m):
+        if not is_private_admin_message(m):
+            return
+        phone = re.sub(r"[\\s\\-().]", "", (m.text or "").strip())
+        if not re.fullmatch(r"\\+?\\d{7,15}", phone):
+            bot.send_message(m.chat.id, "Введите номер в формате +79991234567.")
+            return
+        if not phone.startswith("+"):
+            phone = "+" + phone
+        st = states[m.from_user.id]
+        session_path = SESSIONS_DIR / st["bot_name"] / f"reauth_{uuid.uuid4().hex}.session"
+        session_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            phone_code_hash = asyncio.run(_request_reauth_code(phone, session_path))
+        except FloodWaitError as e:
+            bot.send_message(m.chat.id, f"Telegram ограничил попытки. Повторите через {e.seconds} сек.")
+            return
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                "Reauthorization code request failed: %s", type(e).__name__
+            )
+            bot.send_message(m.chat.id, f"Не удалось запросить код: {type(e).__name__}.")
+            return
+        st.update({
+            "action": "reauth_code",
+            "phone": phone,
+            "phone_code_hash": phone_code_hash,
+            "session_path": str(session_path),
+        })
+        states[m.from_user.id] = st
+        bot.send_message(
+            m.chat.id,
+            "📩 Код отправлен Telegram. Введите его сюда вручную. "
+            "Код не будет записан в журнал.",
+            reply_markup=types.ReplyKeyboardMarkup(resize_keyboard=True).add("❌ Отмена")
+        )
+
+    @bot.message_handler(
+        func=lambda m: states.get(m.from_user.id, {}).get("action") == "reauth_code"
+    )
+    def account_reauth_code(m):
+        if not is_private_admin_message(m):
+            return
+        code = re.sub(r"\\s", "", (m.text or "").strip())
+        if not re.fullmatch(r"\\d{5,6}", code):
+            bot.send_message(m.chat.id, "Введите код Telegram из 5–6 цифр.")
+            return
+        st = states[m.from_user.id]
+        try:
+            me, needs_password = asyncio.run(_complete_reauth_code(
+                st["phone"], code, st["phone_code_hash"], st["session_path"]
+            ))
+        except PhoneCodeInvalidError:
+            bot.send_message(m.chat.id, "❌ Неверный код. Попробуйте ещё раз.")
+            return
+        except PhoneCodeExpiredError:
+            bot.send_message(m.chat.id, "⏳ Код истёк. Отмените вход и начните заново.")
+            return
+        except FloodWaitError as e:
+            bot.send_message(m.chat.id, f"Слишком много попыток. Подождите {e.seconds} сек.")
+            return
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                "Reauthorization code verification failed: %s", type(e).__name__
+            )
+            bot.send_message(m.chat.id, f"Не удалось проверить код: {type(e).__name__}.")
+            return
+        if needs_password:
+            st["action"] = "reauth_password"
+            states[m.from_user.id] = st
+            bot.send_message(
+                m.chat.id,
+                "🔐 На аккаунте включена двухэтапная аутентификация. "
+                "Введите пароль 2FA. Он не будет записан в журнал."
+            )
+            return
+        _save_reauthorized_account(m, st, me)
+
+    @bot.message_handler(
+        func=lambda m: states.get(m.from_user.id, {}).get("action") == "reauth_password"
+    )
+    def account_reauth_password(m):
+        if not is_private_admin_message(m):
+            return
+        password = m.text or ""
+        if not password:
+            bot.send_message(m.chat.id, "Введите пароль 2FA.")
+            return
+        st = states[m.from_user.id]
+        try:
+            me = asyncio.run(_complete_reauth_password(password, st["session_path"]))
+        except PasswordHashInvalidError:
+            bot.send_message(m.chat.id, "❌ Неверный пароль 2FA. Попробуйте ещё раз.")
+            return
+        except Exception as e:
+            logging.getLogger(__name__).warning(
+                "Reauthorization 2FA verification failed: %s", type(e).__name__
+            )
+            bot.send_message(m.chat.id, f"Не удалось проверить 2FA: {type(e).__name__}.")
+            return
+        _save_reauthorized_account(m, st, me)
 
     @bot.callback_query_handler(func=lambda c: c.data == "acc_list")
     def accounts_back(c):
