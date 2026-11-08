@@ -1416,9 +1416,11 @@ def run_admin_bot():
         try:
             phone_code_hash = asyncio.run(_request_reauth_code(phone, session_path))
         except FloodWaitError as e:
+            _cleanup_reauth_session({"session_path": str(session_path)})
             bot.send_message(m.chat.id, f"Telegram ограничил попытки. Повторите через {e.seconds} сек.")
             return
         except Exception as e:
+            _cleanup_reauth_session({"session_path": str(session_path)})
             logging.getLogger(__name__).warning(
                 "Reauthorization code request failed: %s", type(e).__name__
             )
