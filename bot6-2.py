@@ -1220,13 +1220,13 @@ def run_admin_bot():
         accounts = list_telegram_accounts()
         if not accounts:
             body = (
-                "👤 <b>Telegram-аккаунты</b>\\n\\n"
+                "👤 <b>Telegram-аккаунты</b>\n\n"
                 "Пока нет зарегистрированных аккаунтов. После успешного входа через дочернего бота "
                 "аккаунт появится здесь."
             )
             kb = types.InlineKeyboardMarkup()
         else:
-            body = "👤 <b>Ваши Telegram-аккаунты</b>\\nВыберите аккаунт для подробностей:"
+            body = "👤 <b>Ваши Telegram-аккаунты</b>\nВыберите аккаунт для подробностей:"
             kb = types.InlineKeyboardMarkup(row_width=1)
             for acc in accounts[:40]:
                 title = acc.get("first_name") or "Аккаунт"
@@ -1276,13 +1276,13 @@ def run_admin_bot():
         }.get(acc.get("status"), "⚪️ Неизвестно")
         phone = mask_phone(acc.get("phone"))
         body = (
-            f"👤 <b>{html.escape(acc.get('first_name') or 'Telegram-аккаунт')}</b>\\n"
-            f"Username: <b>{html.escape(username)}</b>\\n"
-            f"Telegram ID: <code>{acc['telegram_id']}</code>\\n"
-            f"Номер: <code>{html.escape(phone)}</code>\\n"
-            f"Бот: <code>{html.escape(acc['bot_name'])}</code>\\n"
-            f"Состояние: {status}\\n"
-            f"Последний вход: <code>{html.escape(str(acc.get('last_login_at') or '—'))}</code>\\n"
+            f"👤 <b>{html.escape(acc.get('first_name') or 'Telegram-аккаунт')}</b>\n"
+            f"Username: <b>{html.escape(username)}</b>\n"
+            f"Telegram ID: <code>{acc['telegram_id']}</code>\n"
+            f"Номер: <code>{html.escape(phone)}</code>\n"
+            f"Бот: <code>{html.escape(acc['bot_name'])}</code>\n"
+            f"Состояние: {status}\n"
+            f"Последний вход: <code>{html.escape(str(acc.get('last_login_at') or '—'))}</code>\n"
             f"Последняя проверка: <code>{html.escape(str(acc.get('last_checked_at') or '—'))}</code>"
         )
         kb = types.InlineKeyboardMarkup(row_width=1)
