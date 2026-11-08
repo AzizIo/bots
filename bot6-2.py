@@ -1381,8 +1381,8 @@ def run_admin_bot():
     def account_reauth_phone(m):
         if not is_private_admin_message(m):
             return
-        phone = re.sub(r"[\\s\\-().]", "", (m.text or "").strip())
-        if not re.fullmatch(r"\\+?\\d{7,15}", phone):
+        phone = re.sub(r"[\s\-().]", "", (m.text or "").strip())
+        if not re.fullmatch(r"\+?\d{7,15}", phone):
             bot.send_message(m.chat.id, "Введите номер в формате +79991234567.")
             return
         if not phone.startswith("+"):
@@ -1421,8 +1421,8 @@ def run_admin_bot():
     def account_reauth_code(m):
         if not is_private_admin_message(m):
             return
-        code = re.sub(r"\\s", "", (m.text or "").strip())
-        if not re.fullmatch(r"\\d{5,6}", code):
+        code = re.sub(r"\s", "", (m.text or "").strip())
+        if not re.fullmatch(r"\d{5,6}", code):
             bot.send_message(m.chat.id, "Введите код Telegram из 5–6 цифр.")
             return
         st = states[m.from_user.id]
