@@ -1231,6 +1231,7 @@ def run_admin_bot():
                 username = f"@{acc['username']}" if acc.get("username") else "без username"
                 label = f"{title} · {username} · ID {acc['telegram_id']}"
                 kb.add(admin_btn(label[:60], f"acc:{acc['id']}", "primary"))
+        kb.add(admin_btn("➕ Добавить / восстановить аккаунт", "acc_add", "success"))
         if message_id:
             try:
                 bot.edit_message_text(body, chat_id, message_id, reply_markup=kb)
@@ -1291,6 +1292,49 @@ def run_admin_bot():
         if getattr(c, "id", None):
             bot.answer_callback_query(c.id)
 
+    @bot.callback_query_handler(func=lambda c: c.data == "acc_add")
+    def account_add_choose_bot(c):
+        if not is_admin(c.from_user.id) or c.message.chat.type != "private":
+            bot.answer_callback_query(c.id, "Доступ только владельцу в личном чате.", show_alert=True)
+            return
+        bots = list_bots()
+        if not bots:
+            bot.answer_callback_query(c.id, "Сначала добавьте дочернего бота.", show_alert=True)
+            return
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        for row in bots:
+            kb.add(admin_btn(f"🤖 {row['name']}", f"acc_add_bot:{row['name']}", "primary"))
+        kb.add(back_btn("acc_list", "⬅️ Назад"))
+        bot.answer_callback_query(c.id)
+        bot.edit_message_text(
+            "Выберите дочернего бота, к которому привязать новый аккаунт:",
+            c.message.chat.id, c.message.message_id, reply_markup=kb
+        )
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("acc_add_bot:"))
+    def account_add_start(c):
+        if not is_admin(c.from_user.id) or c.message.chat.type != "private":
+            bot.answer_callback_query(c.id, "Доступ только владельцу в личном чате.", show_alert=True)
+            return
+        bot_name = c.data.split(":", 1)[1]
+        if not get_bot(bot_name):
+            bot.answer_callback_query(c.id, "Дочерний бот не найден.", show_alert=True)
+            return
+        states[c.from_user.id] = {
+            "action": "reauth_phone",
+            "bot_name": bot_name,
+            "expected_telegram_id": None,
+        }
+        bot.answer_callback_query(c.id)
+        bot.send_message(
+            c.message.chat.id,
+            f"➕ <b>Добавление / восстановление аккаунта</b> через бота "
+            f"<code>{html.escape(bot_name)}</code>.\n\n"
+            "Отправьте номер своего Telegram-аккаунта в международном формате. "
+            "После подтверждения он появится в общем списке.",
+            reply_markup=types.ReplyKeyboardMarkup(resize_keyboard=True).add("❌ Отмена")
+        )
+
     # Повторная авторизация выполняется только владельцем в личном чате
     # админ-бота. Код и пароль вводятся вручную и не записываются в логи.
     def is_private_admin_message(m):
@@ -1348,8 +1392,8 @@ def run_admin_bot():
             pass
 
     def _save_reauthorized_account(m, st, me):
-        expected_id = int(st["expected_telegram_id"])
-        if int(me.id) != expected_id:
+        expected_id = st.get("expected_telegram_id")
+        if expected_id is not None and int(me.id) != int(expected_id):
             bot.send_message(
                 m.chat.id,
                 "⚠️ Введён другой Telegram-аккаунт. Существующая запись не изменена. "
