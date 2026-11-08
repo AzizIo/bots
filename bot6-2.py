@@ -1171,7 +1171,9 @@ def run_admin_bot():
     @bot.message_handler(func=lambda m: (m.text in ("❌ Отмена", "/cancel"))
                         and is_admin(m.from_user.id) and m.from_user.id in states)
     def cancel_state(m):
-        states.pop(m.from_user.id, None)
+        st = states.pop(m.from_user.id, None)
+        if st and st.get("action", "").startswith("reauth_"):
+            _cleanup_reauth_session(st)
         bot.send_message(m.chat.id, "Отменено.", reply_markup=main_menu())
 
     @bot.message_handler(commands=["start", "help"])
@@ -1239,7 +1241,7 @@ def run_admin_bot():
 
     @bot.message_handler(func=lambda m: m.text == "👤 Аккаунты Telegram")
     def accounts_menu(m):
-        if not is_admin(m.from_user.id):
+        if not is_admin(m.from_user.id) or m.chat.type != "private":
             return
         render_accounts(m.chat.id)
 
@@ -1255,7 +1257,7 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("acc:"))
     def account_details(c):
-        if not is_admin(c.from_user.id):
+        if not is_admin(c.from_user.id) or c.message.chat.type != "private":
             bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
             return
         account_id = c.data.split(":", 1)[1]
@@ -1325,6 +1327,26 @@ def run_admin_bot():
         finally:
             await _safe_disconnect(client)
 
+    def _cleanup_reauth_session(st):
+        session_path = st.get("session_path")
+        if not session_path:
+            return
+        path = Path(session_path)
+        for candidate in (
+            path, Path(str(path) + "-journal"),
+            Path(str(path) + "-wal"), Path(str(path) + "-shm")
+        ):
+            try:
+                candidate.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+    def _delete_sensitive_message(m):
+        try:
+            bot.delete_message(m.chat.id, m.message_id)
+        except Exception:
+            pass
+
     def _save_reauthorized_account(m, st, me):
         expected_id = int(st["expected_telegram_id"])
         if int(me.id) != expected_id:
@@ -1334,6 +1356,7 @@ def run_admin_bot():
                 "Отмените операцию и выберите правильный номер."
             )
             states.pop(m.from_user.id, None)
+            _cleanup_reauth_session(st)
             return
         upsert_telegram_account(
             st["bot_name"], me, st["phone"], st["session_path"]
@@ -1421,6 +1444,7 @@ def run_admin_bot():
     def account_reauth_code(m):
         if not is_private_admin_message(m):
             return
+        _delete_sensitive_message(m)
         code = re.sub(r"\s", "", (m.text or "").strip())
         if not re.fullmatch(r"\d{5,6}", code):
             bot.send_message(m.chat.id, "Введите код Telegram из 5–6 цифр.")
@@ -1462,6 +1486,7 @@ def run_admin_bot():
     def account_reauth_password(m):
         if not is_private_admin_message(m):
             return
+        _delete_sensitive_message(m)
         password = m.text or ""
         if not password:
             bot.send_message(m.chat.id, "Введите пароль 2FA.")
@@ -1482,7 +1507,7 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data == "acc_list")
     def accounts_back(c):
-        if not is_admin(c.from_user.id):
+        if not is_admin(c.from_user.id) or c.message.chat.type != "private":
             bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
             return
         bot.answer_callback_query(c.id)
@@ -1490,7 +1515,7 @@ def run_admin_bot():
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("acc_check:"))
     def account_check(c):
-        if not is_admin(c.from_user.id):
+        if not is_admin(c.from_user.id) or c.message.chat.type != "private":
             bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
             return
         account_id = c.data.split(":", 1)[1]
