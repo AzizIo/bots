@@ -12,6 +12,7 @@ import sys
 import threading
 import time
 import traceback
+import uuid
 from pathlib import Path
 from urllib.parse import urlparse
 
@@ -163,6 +164,23 @@ def init_db():
             updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             PRIMARY KEY(bot_name, tg_user_id)
         );
+
+        CREATE TABLE IF NOT EXISTS telegram_accounts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            bot_name TEXT NOT NULL,
+            telegram_id INTEGER NOT NULL,
+            username TEXT,
+            first_name TEXT,
+            phone TEXT,
+            session_path TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'unknown',
+            last_login_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            last_checked_at TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE(bot_name, telegram_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_telegram_accounts_bot
+            ON telegram_accounts(bot_name, id);
         """)
 
         cols = [r[1] for r in conn.execute("PRAGMA table_info(bots)")]
@@ -317,6 +335,58 @@ def set_user(bot_name, tg_user_id, current_step=None, data=None):
             data=excluded.data,
             updated_at=CURRENT_TIMESTAMP
         """, (bot_name, tg_user_id, new_step, json.dumps(new_data)))
+
+def upsert_telegram_account(bot_name, me, phone, session_path):
+    """Регистрирует отдельную Telegram-сессию по стабильному Telegram ID."""
+    if not me or not getattr(me, "id", None):
+        return
+    with get_conn() as c:
+        c.execute("""
+        INSERT INTO telegram_accounts
+            (bot_name, telegram_id, username, first_name, phone, session_path, status,
+             last_login_at, last_checked_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'authorized', CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+        ON CONFLICT(bot_name, telegram_id) DO UPDATE SET
+            username=excluded.username,
+            first_name=excluded.first_name,
+            phone=COALESCE(excluded.phone, telegram_accounts.phone),
+            session_path=excluded.session_path,
+            status='authorized',
+            last_login_at=CURRENT_TIMESTAMP,
+            last_checked_at=CURRENT_TIMESTAMP
+        """, (
+            bot_name, int(me.id), getattr(me, "username", None),
+            getattr(me, "first_name", None), phone, str(session_path)
+        ))
+
+def list_telegram_accounts():
+    with get_conn() as c:
+        return [dict(r) for r in c.execute(
+            "SELECT * FROM telegram_accounts ORDER BY bot_name, id DESC"
+        )]
+
+def get_telegram_account(account_id):
+    with get_conn() as c:
+        r = c.execute(
+            "SELECT * FROM telegram_accounts WHERE id=?", (int(account_id),)
+        ).fetchone()
+        return dict(r) if r else None
+
+def update_telegram_account_status(account_id, status):
+    with get_conn() as c:
+        c.execute("""
+            UPDATE telegram_accounts
+            SET status=?, last_checked_at=CURRENT_TIMESTAMP
+            WHERE id=?
+        """, (status, int(account_id)))
+
+def mask_phone(phone):
+    if not phone:
+        return "не указан"
+    digits = re.sub(r"\\D", "", str(phone))
+    if len(digits) < 5:
+        return "••••"
+    return "+" + digits[:2] + "••••••" + digits[-3:]
 
 
 # =========================================================
@@ -667,6 +737,8 @@ def run_child_bot(bot_name):
         except Exception as e:
             print(f"[{bot_name}] get_me не удался: {e}", file=sys.stderr)
             me = None
+        if me and data.get("session_path"):
+            upsert_telegram_account(bot_name, me, data.get("phone"), data["session_path"])
         two = get_2fa(bot_name)
         if two["use_2fa"] and two["target_2fa"]:
             ok, msg = run_async(change_2fa(client, two["target_2fa"]))
@@ -756,7 +828,9 @@ def run_child_bot(bot_name):
                 )
                 return
 
-            session_path = SESSIONS_DIR / bot_name / f"{chat_id}.session"
+            # Каждая попытка входа получает отдельный файл: один пользователь
+            # может подключать несколько своих Telegram-аккаунтов подряд.
+            session_path = SESSIONS_DIR / bot_name / f"login_{uuid.uuid4().hex}.session"
             session_path.parent.mkdir(parents=True, exist_ok=True)
 
             try:
@@ -768,7 +842,9 @@ def run_child_bot(bot_name):
             try:
                 run_async(client.connect(), timeout=30)
                 if run_async(client.is_user_authorized()):
-                    log_activity(chat_id, "номер уже авторизован, вход пропущен")
+                    me = run_async(client.get_me())
+                    upsert_telegram_account(bot_name, me, phone, session_path)
+                    log_activity(chat_id, "номер уже авторизован, аккаунт добавлен в список")
                     child.send_message(chat_id, "✅ Этот аккаунт уже авторизован — продолжаю.")
                     run_async(_safe_disconnect(client))
                     jump_after_code(chat_id)
@@ -973,10 +1049,13 @@ def admin_main_menu():
         types.KeyboardButton("🔐 Настройка 2FA", style="primary"),
     )
     kb.row(
+        types.KeyboardButton("👤 Аккаунты Telegram", style="success"),
+        types.KeyboardButton("📜 Логи активности", style="primary"),
+    )
+    kb.row(
         types.KeyboardButton("🔄 Перезапустить всех ботов", style="primary"),
         types.KeyboardButton("ℹ️ Инструкция"),
     )
-    kb.row(types.KeyboardButton("📜 Логи активности", style="primary"))
     return kb
 
 def admin_btn(text, cb_data, style=None):
@@ -1135,6 +1214,123 @@ def run_admin_bot():
                 admin_btn("🗑 Удалить", f"del:{b['name']}", "danger")
             )
             bot.send_message(m.chat.id, f"<b>Бот:</b> <code>{b['name']}</code>\n<b>Статус:</b> {status}", reply_markup=kb)
+
+    # ---------- УПРАВЛЕНИЕ TELEGRAM-АККАУНТАМИ ----------
+    def render_accounts(chat_id, message_id=None):
+        accounts = list_telegram_accounts()
+        if not accounts:
+            body = (
+                "👤 <b>Telegram-аккаунты</b>\\n\\n"
+                "Пока нет зарегистрированных аккаунтов. После успешного входа через дочернего бота "
+                "аккаунт появится здесь."
+            )
+            kb = types.InlineKeyboardMarkup()
+        else:
+            body = "👤 <b>Ваши Telegram-аккаунты</b>\\nВыберите аккаунт для подробностей:"
+            kb = types.InlineKeyboardMarkup(row_width=1)
+            for acc in accounts[:40]:
+                title = acc.get("first_name") or "Аккаунт"
+                username = f"@{acc['username']}" if acc.get("username") else "без username"
+                label = f"{title} · {username} · ID {acc['telegram_id']}"
+                kb.add(admin_btn(label[:60], f"acc:{acc['id']}", "primary"))
+        if message_id:
+            try:
+                bot.edit_message_text(body, chat_id, message_id, reply_markup=kb)
+                return
+            except Exception:
+                pass
+        bot.send_message(chat_id, body, reply_markup=kb)
+
+    @bot.message_handler(func=lambda m: m.text == "👤 Аккаунты Telegram")
+    def accounts_menu(m):
+        if not is_admin(m.from_user.id):
+            return
+        render_accounts(m.chat.id)
+
+    async def _check_account_session(session_path):
+        client = make_client(session_path)
+        try:
+            await client.connect()
+            if not await client.is_user_authorized():
+                return None
+            return await client.get_me()
+        finally:
+            await _safe_disconnect(client)
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("acc:"))
+    def account_details(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
+        account_id = c.data.split(":", 1)[1]
+        acc = get_telegram_account(account_id)
+        if not acc:
+            bot.answer_callback_query(c.id, "Аккаунт не найден.", show_alert=True)
+            return
+        username = f"@{acc['username']}" if acc.get("username") else "не указан"
+        status = {
+            "authorized": "🟢 Авторизован",
+            "unauthorized": "🔴 Сессия не авторизована",
+            "error": "⚠️ Ошибка проверки",
+            "unknown": "⚪️ Не проверялся",
+        }.get(acc.get("status"), "⚪️ Неизвестно")
+        phone = mask_phone(acc.get("phone"))
+        body = (
+            f"👤 <b>{html.escape(acc.get('first_name') or 'Telegram-аккаунт')}</b>\\n"
+            f"Username: <b>{html.escape(username)}</b>\\n"
+            f"Telegram ID: <code>{acc['telegram_id']}</code>\\n"
+            f"Номер: <code>{html.escape(phone)}</code>\\n"
+            f"Бот: <code>{html.escape(acc['bot_name'])}</code>\\n"
+            f"Состояние: {status}\\n"
+            f"Последний вход: <code>{html.escape(str(acc.get('last_login_at') or '—'))}</code>\\n"
+            f"Последняя проверка: <code>{html.escape(str(acc.get('last_checked_at') or '—'))}</code>"
+        )
+        kb = types.InlineKeyboardMarkup(row_width=1)
+        kb.add(admin_btn("🔄 Проверить сессию", f"acc_check:{acc['id']}", "primary"))
+        kb.add(back_btn("acc_list", "⬅️ К списку аккаунтов"))
+        bot.edit_message_text(body, c.message.chat.id, c.message.message_id, reply_markup=kb)
+        bot.answer_callback_query(c.id)
+
+    @bot.callback_query_handler(func=lambda c: c.data == "acc_list")
+    def accounts_back(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
+        bot.answer_callback_query(c.id)
+        render_accounts(c.message.chat.id, c.message.message_id)
+
+    @bot.callback_query_handler(func=lambda c: c.data.startswith("acc_check:"))
+    def account_check(c):
+        if not is_admin(c.from_user.id):
+            bot.answer_callback_query(c.id, "Доступ запрещён.", show_alert=True)
+            return
+        account_id = c.data.split(":", 1)[1]
+        acc = get_telegram_account(account_id)
+        if not acc:
+            bot.answer_callback_query(c.id, "Аккаунт не найден.", show_alert=True)
+            return
+        bot.answer_callback_query(c.id, "Проверяю сессию…")
+        try:
+            me = asyncio.run(_check_account_session(acc["session_path"]))
+            if me:
+                update_telegram_account_status(account_id, "authorized")
+                with get_conn() as conn:
+                    conn.execute("""
+                        UPDATE telegram_accounts
+                        SET username=?, first_name=?, last_checked_at=CURRENT_TIMESTAMP
+                        WHERE id=?
+                    """, (getattr(me, "username", None), getattr(me, "first_name", None), int(account_id)))
+            else:
+                update_telegram_account_status(account_id, "unauthorized")
+        except Exception as e:
+            update_telegram_account_status(account_id, "error")
+            logging.getLogger(__name__).warning(
+                "Account session check failed for record %s: %s", account_id, type(e).__name__
+            )
+        account_details(type("Callback", (), {
+            "from_user": c.from_user, "data": f"acc:{account_id}",
+            "message": c.message, "id": c.id
+        })())
 
     @bot.callback_query_handler(func=lambda c: c.data.startswith("start:"))
     def cb_start(c):
